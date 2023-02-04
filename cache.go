@@ -3,10 +3,13 @@ package zipcache
 import (
 	"bytes"
 	"compress/flate"
+	"errors"
+	"sync"
+	"sync/atomic"
 )
 
 const (
-	blockSize               = 4096
+	blockSizeDefault        = 4096
 	compressionLevelDefault = 1
 )
 
@@ -16,10 +19,15 @@ type Block struct {
 	data         []byte
 }
 
-type CompressedCache struct {
-	m map[string]pointer
+var ErrCompressionRunning = errors.New("already running compression")
 
-	blocks []*Block
+type CompressedCache struct {
+	isCompressing atomic.Bool
+
+	mtx sync.RWMutex
+	m   map[string]pointer
+
+	blocks []atomic.Pointer[Block]
 
 	currBlockOffset uint32
 }
@@ -38,20 +46,25 @@ func (p pointer) Len() int {
 	return int(uint16(p))
 }
 
-func New() *CompressedCache {
-	return &CompressedCache{
-		m: map[string]pointer{},
-		blocks: []*Block{
-			{
-				size:         0,
-				isCompressed: false,
-				data:         make([]byte, blockSize),
-			},
-		},
+func newBlock() *Block {
+	return &Block{
+		size:         0,
+		isCompressed: false,
+		data:         make([]byte, blockSizeDefault),
 	}
 }
 
-func (c *CompressedCache) compress() error {
+func New() *CompressedCache {
+	c := &CompressedCache{
+		isCompressing: atomic.Bool{},
+		m:             map[string]pointer{},
+		blocks:        make([]atomic.Pointer[Block], 1),
+	}
+	c.blocks[0].Store(newBlock())
+	return c
+}
+
+func (c *CompressedCache) compressBlock(ptr atomic.Pointer[Block]) error {
 	var buf bytes.Buffer
 
 	w, err := flate.NewWriter(&buf, compressionLevelDefault)
@@ -59,8 +72,8 @@ func (c *CompressedCache) compress() error {
 		return err
 	}
 
-	bb := c.blocks[len(c.blocks)-1]
-	if _, err := w.Write(bb.data[:c.currBlockOffset]); err != nil {
+	b := ptr.Load()
+	if _, err := w.Write(b.data[:c.currBlockOffset]); err != nil {
 		return err
 	}
 
@@ -68,10 +81,17 @@ func (c *CompressedCache) compress() error {
 		return err
 	}
 
-	if buf.Len() < len(bb.data) { // TODO: check if compressed data saves at least some percentage of space
-		bb.data = buf.Bytes()
-		bb.isCompressed = true
+	newBlock := &Block{
+		isCompressed: buf.Len() < len(b.data),
+		data:         b.data,
 	}
+
+	if buf.Len() < len(b.data) { // TODO: check if compressed data saves at least some percentage of space
+		newBlock.data = buf.Bytes()
+	}
+
+	ptr.Store(newBlock)
+	c.isCompressing.Store(false)
 	return err
 }
 
@@ -80,30 +100,45 @@ func (c *CompressedCache) uncompress(src, dst []byte) (int, error) {
 	return r.Read(dst)
 }
 
+func newPointer(blockOffset, byteOffset, len uint64) pointer {
+	return pointer((blockOffset << 32) + (byteOffset << 16) + len)
+}
+
 func (c *CompressedCache) Put(k, v []byte) error {
-	// check len(v) <= maxuint16
-	if c.currBlockOffset+uint32(len(v)) > blockSize {
-		if err := c.compress(); err != nil {
-			return err
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	currBlockPtr := c.blocks[len(c.blocks)-1]
+	if c.currBlockOffset+uint32(len(v)) > blockSizeDefault {
+		if !c.isCompressing.CompareAndSwap(false, true) {
+			return ErrCompressionRunning
 		}
-		c.blocks = append(c.blocks, &Block{
+
+		prevBlockPtr := currBlockPtr
+		currBlock := &Block{
 			size:         0,
 			isCompressed: false,
-			data:         make([]byte, blockSize),
-		})
+			data:         make([]byte, blockSizeDefault),
+		}
+		var ptr atomic.Pointer[Block]
+		ptr.Store(currBlock)
+
+		c.blocks = append(c.blocks, ptr)
 		c.currBlockOffset = 0
+
+		go c.compressBlock(prevBlockPtr)
 	}
 
 	newOffset := c.currBlockOffset + uint32(len(v))
 
-	bb := c.blocks[len(c.blocks)-1]
-	copy(bb.data[c.currBlockOffset:], v)
+	currBlock := currBlockPtr.Load()
+	copy(currBlock.data[c.currBlockOffset:], v)
 
-	bOff := uint64(uint32(len(c.blocks) - 1))
-	off := uint64(c.currBlockOffset)
+	blockOffset := uint64(uint32(len(c.blocks) - 1))
+	byteOffset := uint64(c.currBlockOffset)
 	len := uint64(len(v))
 
-	c.m[string(k)] = pointer((bOff << 32) + (off << 16) + len)
+	c.m[string(k)] = newPointer(blockOffset, byteOffset, len)
 
 	c.currBlockOffset = newOffset
 
@@ -111,15 +146,20 @@ func (c *CompressedCache) Put(k, v []byte) error {
 }
 
 func (c *CompressedCache) Get(k []byte) ([]byte, error) {
+	c.mtx.RLock()
+
 	ptr, ok := c.m[string(k)]
 	if !ok {
+		c.mtx.RUnlock()
 		return nil, nil
 	}
 
-	bb := c.blocks[ptr.Block()]
+	bb := c.blocks[ptr.Block()].Load()
+	c.mtx.RUnlock()
+
 	data := bb.data
 	if bb.isCompressed {
-		dst := make([]byte, blockSize) // keep this separatedly?
+		dst := make([]byte, blockSizeDefault) // keep this separatedly?
 		_, err := c.uncompress(bb.data, dst)
 		if err != nil {
 			return nil, err
