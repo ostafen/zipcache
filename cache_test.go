@@ -10,17 +10,17 @@ import (
 )
 
 func TestSingleThread(t *testing.T) {
-	cache := New(DefaultConfig())
+	cache := New(DefaultConfig().WithChunkSize(100))
 
 	keys := make([][]byte, 0)
 	values := make([][]byte, 0)
 
 	rand.Seed(time.Now().Unix())
 
-	n := 4 * 12000
+	n := 1000
 	for i := 0; i < n; i++ {
 		k := make([]byte, 8)
-		v := make([]byte, rand.Int()%101)
+		v := make([]byte, 10+rand.Int()%256+1)
 
 		rand.Read(k)
 		rand.Read(v)
@@ -30,7 +30,7 @@ func TestSingleThread(t *testing.T) {
 		}
 
 		err := cache.Put(k, v)
-		if errors.Is(err, ErrKeyExist) {
+		if errors.Is(err, ErrKeyBound) {
 			continue
 		}
 		require.NoError(t, err)

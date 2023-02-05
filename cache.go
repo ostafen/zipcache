@@ -15,7 +15,7 @@ type chunk struct {
 }
 
 var (
-	ErrKeyExist = errors.New("key already exists")
+	ErrKeyBound = errors.New("key already bound")
 )
 
 type Writer interface {
@@ -119,7 +119,7 @@ func New(cfg Config) *ZipCache {
 	return c
 }
 
-func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
+func (c *ZipCache) compressChunks(ptrs []*atomic.Pointer[chunk]) error {
 	for _, ptr := range ptrs {
 		var buf bytes.Buffer
 
@@ -158,6 +158,7 @@ func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 	return nil
 }
 
+// TODO: do not create reader multiple times
 func (c *ZipCache) uncompress(src, dst []byte) (int, error) {
 	r, err := c.cfg.NewReader(bytes.NewBuffer(src))
 	if err != nil {
@@ -176,7 +177,7 @@ func (c *ZipCache) Put(k, v []byte) error {
 	defer c.mtx.Unlock()
 
 	if _, has := c.m[string(k)]; has {
-		return ErrKeyExist
+		return ErrKeyBound
 	}
 
 	c.m[string(k)] = newPointer(uint64(uint32(len(c.chunks)-1)), uint64(c.currChunkOffset), uint64(len(v)))
@@ -207,7 +208,7 @@ func (c *ZipCache) Put(k, v []byte) error {
 	}
 
 	if len(compressChunks) > 0 {
-		go c.compressBlock(compressChunks)
+		go c.compressChunks(compressChunks)
 	}
 	return nil
 }
@@ -230,7 +231,9 @@ func (c *ZipCache) Get(k []byte) ([]byte, error) {
 	nChunks := 1 + (ptr.Len()+(c.cfg.ChunkSize-1))/c.cfg.ChunkSize
 	chunks := make([]*chunk, 0, nChunks)
 	for i := 0; i < nChunks; i++ {
-		chunks = append(chunks, c.chunks[i+ptr.Block()].Load())
+		if i+ptr.Block() < len(c.chunks) {
+			chunks = append(chunks, c.chunks[i+ptr.Block()].Load())
+		}
 	}
 	c.mtx.RUnlock()
 
