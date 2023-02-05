@@ -28,8 +28,7 @@ type ZipCache struct {
 	mtx sync.RWMutex
 	m   map[string]pointer
 
-	blocks []*atomic.Pointer[chunk]
-
+	chunks          []*atomic.Pointer[chunk]
 	nChunks         atomic.Int32
 	currChunkOffset uint32
 }
@@ -48,7 +47,7 @@ func (p pointer) Len() int {
 	return int(uint16(p))
 }
 
-func newBlock() *chunk {
+func newChunk() *chunk {
 	return &chunk{
 		isCompressed: false,
 		data:         make([]byte, chunkSizeDefault),
@@ -59,10 +58,10 @@ func New() *ZipCache {
 	c := &ZipCache{
 		isCompressing: atomic.Bool{},
 		m:             map[string]pointer{},
-		blocks:        make([]*atomic.Pointer[chunk], 0),
+		chunks:        make([]*atomic.Pointer[chunk], 0),
 	}
-	c.blocks = append(c.blocks, &atomic.Pointer[chunk]{})
-	c.blocks[0].Store(newBlock())
+	c.chunks = append(c.chunks, &atomic.Pointer[chunk]{})
+	c.chunks[0].Store(newChunk())
 	c.nChunks.Store(1)
 	return c
 }
@@ -120,13 +119,13 @@ func (c *ZipCache) Put(k, v []byte) error {
 		return ErrKeyExist
 	}
 
-	c.m[string(k)] = newPointer(uint64(uint32(len(c.blocks)-1)), uint64(c.currChunkOffset), uint64(len(v)))
+	c.m[string(k)] = newPointer(uint64(uint32(len(c.chunks)-1)), uint64(c.currChunkOffset), uint64(len(v)))
 
 	compressChunks := make([]*atomic.Pointer[chunk], 0)
 
 	size := len(v)
 	for size > 0 {
-		currChunkPtr := c.blocks[len(c.blocks)-1]
+		currChunkPtr := c.chunks[len(c.chunks)-1]
 		currChunk := currChunkPtr.Load()
 
 		n := copy(currChunk.data[c.currChunkOffset:], v[len(v)-size:])
@@ -136,10 +135,10 @@ func (c *ZipCache) Put(k, v []byte) error {
 			compressChunks = append(compressChunks, currChunkPtr)
 
 			var ptr atomic.Pointer[chunk]
-			bb := newBlock()
-			ptr.Store(bb)
+			ck := newChunk()
+			ptr.Store(ck)
 
-			c.blocks = append(c.blocks, &ptr)
+			c.chunks = append(c.chunks, &ptr)
 			c.currChunkOffset = 0
 
 			c.nChunks.Add(1)
@@ -162,7 +161,7 @@ func (c *ZipCache) Get(k []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	currChunk := c.blocks[ptr.Block()].Load()
+	currChunk := c.chunks[ptr.Block()].Load()
 	if !currChunk.isCompressed && (ptr.Offset()+ptr.Len() <= len(currChunk.data)) {
 		c.mtx.RUnlock()
 		return currChunk.data[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
@@ -171,7 +170,7 @@ func (c *ZipCache) Get(k []byte) ([]byte, error) {
 	nChunks := 1 + (ptr.Len()+(chunkSizeDefault-1))/chunkSizeDefault
 	chunks := make([]*chunk, 0, nChunks)
 	for i := 0; i < nChunks; i++ {
-		chunks = append(chunks, c.blocks[i+ptr.Block()].Load())
+		chunks = append(chunks, c.chunks[i+ptr.Block()].Load())
 	}
 	c.mtx.RUnlock()
 
@@ -210,8 +209,8 @@ func (c *ZipCache) Size() int64 {
 	c.mtx.RLock()
 
 	var size int64
-	for _, b := range c.blocks {
-		size += int64(len(b.Load().data))
+	for _, ck := range c.chunks {
+		size += int64(len(ck.Load().data))
 	}
 
 	c.mtx.RUnlock()
