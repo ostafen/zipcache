@@ -2,8 +2,9 @@ package zipcache
 
 import (
 	"bytes"
-	"compress/gzip"
+	"compress/flate"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 )
@@ -17,9 +18,31 @@ var (
 	ErrKeyExist = errors.New("key already exists")
 )
 
+type Writer interface {
+	io.WriteCloser
+	Flush() error
+}
+
+type Reader interface {
+	io.ReadCloser
+}
+
+type WriterFactory func(w io.Writer) (Writer, error)
+type ReaderFactory func(w io.Reader) (Reader, error)
+
+func flateWriter(w io.Writer) (Writer, error) {
+	return flate.NewWriter(w, flate.BestSpeed)
+}
+
+func flateReader(r io.Reader) (Reader, error) {
+	return flate.NewReader(r), nil
+}
+
 type Config struct {
 	ChunkSize    int
 	ChunkMinGain float64
+	NewWriter    WriterFactory
+	NewReader    ReaderFactory
 }
 
 const (
@@ -31,7 +54,25 @@ func DefaultConfig() Config {
 	return Config{
 		ChunkSize:    chunkSizeDefault,
 		ChunkMinGain: chunkMinRatioDefault,
+		NewWriter:    flateWriter,
+		NewReader:    flateReader,
 	}
+}
+
+func (cfg Config) WithChunkSize(size int) Config {
+	cfg.ChunkSize = size
+	return cfg
+}
+
+func (cfg Config) WithChunkMinGain(gain float64) Config {
+	cfg.ChunkMinGain = gain
+	return cfg
+}
+
+func (cfg Config) WithReaderWriter(r ReaderFactory, w WriterFactory) Config {
+	cfg.NewReader = r
+	cfg.NewWriter = w
+	return cfg
 }
 
 type ZipCache struct {
@@ -82,7 +123,10 @@ func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 	for _, ptr := range ptrs {
 		var buf bytes.Buffer
 
-		w := gzip.NewWriter(&buf)
+		w, err := c.cfg.NewWriter(&buf)
+		if err != nil {
+			return err
+		}
 
 		b := ptr.Load()
 
@@ -115,7 +159,11 @@ func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 }
 
 func (c *ZipCache) uncompress(src, dst []byte) (int, error) {
-	r, _ := gzip.NewReader(bytes.NewReader(src))
+	r, err := c.cfg.NewReader(bytes.NewBuffer(src))
+	if err != nil {
+		return -1, err
+	}
+	defer r.Close()
 	return r.Read(dst)
 }
 
