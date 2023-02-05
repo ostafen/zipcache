@@ -10,7 +10,7 @@ import (
 )
 
 func TestSingleThread(t *testing.T) {
-	cache := New()
+	cache := New(DefaultConfig())
 
 	keys := make([][]byte, 0)
 	values := make([][]byte, 0)

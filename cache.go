@@ -8,11 +8,6 @@ import (
 	"sync/atomic"
 )
 
-const (
-	chunkSizeDefault        = 4096
-	compressionLevelDefault = 1
-)
-
 type chunk struct {
 	isCompressed bool
 	data         []byte
@@ -22,8 +17,25 @@ var (
 	ErrKeyExist = errors.New("key already exists")
 )
 
+type Config struct {
+	ChunkSize    int
+	ChunkMinGain float64
+}
+
+const (
+	chunkSizeDefault     = 4096
+	chunkMinRatioDefault = 0.05
+)
+
+func DefaultConfig() Config {
+	return Config{
+		ChunkSize:    chunkSizeDefault,
+		ChunkMinGain: chunkMinRatioDefault,
+	}
+}
+
 type ZipCache struct {
-	isCompressing atomic.Bool
+	cfg Config
 
 	mtx sync.RWMutex
 	m   map[string]pointer
@@ -47,21 +59,21 @@ func (p pointer) Len() int {
 	return int(uint16(p))
 }
 
-func newChunk() *chunk {
+func (c *ZipCache) newChunk() *chunk {
 	return &chunk{
 		isCompressed: false,
-		data:         make([]byte, chunkSizeDefault),
+		data:         make([]byte, c.cfg.ChunkSize),
 	}
 }
 
-func New() *ZipCache {
+func New(cfg Config) *ZipCache {
 	c := &ZipCache{
-		isCompressing: atomic.Bool{},
-		m:             map[string]pointer{},
-		chunks:        make([]*atomic.Pointer[chunk], 0),
+		cfg:    cfg,
+		m:      map[string]pointer{},
+		chunks: make([]*atomic.Pointer[chunk], 0),
 	}
 	c.chunks = append(c.chunks, &atomic.Pointer[chunk]{})
-	c.chunks[0].Store(newChunk())
+	c.chunks[0].Store(c.newChunk())
 	c.nChunks.Store(1)
 	return c
 }
@@ -91,14 +103,14 @@ func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 			data:         b.data,
 		}
 
-		if buf.Len() < len(b.data) { // TODO: check if compressed data saves at least some percentage of space
+		gain := 1 - (float64(buf.Len()) / float64(len(b.data)))
+		if gain >= c.cfg.ChunkMinGain {
 			newBlock.data = buf.Bytes()
 		}
 
 		ptr.Store(newBlock)
 	}
 
-	c.isCompressing.Store(false)
 	return nil
 }
 
@@ -131,11 +143,11 @@ func (c *ZipCache) Put(k, v []byte) error {
 		n := copy(currChunk.data[c.currChunkOffset:], v[len(v)-size:])
 		c.currChunkOffset += uint32(n)
 
-		if c.currChunkOffset == chunkSizeDefault {
+		if c.currChunkOffset == uint32(c.cfg.ChunkSize) {
 			compressChunks = append(compressChunks, currChunkPtr)
 
 			var ptr atomic.Pointer[chunk]
-			ck := newChunk()
+			ck := c.newChunk()
 			ptr.Store(ck)
 
 			c.chunks = append(c.chunks, &ptr)
@@ -167,7 +179,7 @@ func (c *ZipCache) Get(k []byte) ([]byte, error) {
 		return currChunk.data[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
 	}
 
-	nChunks := 1 + (ptr.Len()+(chunkSizeDefault-1))/chunkSizeDefault
+	nChunks := 1 + (ptr.Len()+(c.cfg.ChunkSize-1))/c.cfg.ChunkSize
 	chunks := make([]*chunk, 0, nChunks)
 	for i := 0; i < nChunks; i++ {
 		chunks = append(chunks, c.chunks[i+ptr.Block()].Load())
@@ -181,7 +193,7 @@ func (c *ZipCache) Get(k []byte) ([]byte, error) {
 		uncompressed := chunk.data
 
 		if chunk.isCompressed {
-			uncompressed = make([]byte, chunkSizeDefault)
+			uncompressed = make([]byte, c.cfg.ChunkSize)
 			_, err := c.uncompress(chunk.data, uncompressed)
 			if err != nil {
 				return nil, err
