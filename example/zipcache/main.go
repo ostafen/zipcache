@@ -25,7 +25,10 @@ func main() {
 	data, err := io.ReadAll(f)
 	fatalIfErr(err)
 
-	cache := zipcache.New()
+	cache := zipcache.New(zipcache.Config{
+		ChunkSize:    4096 * 4, // defines how many entries will be compressed together. It depends on the average entry size.
+		ChunkMinGain: 0.05,     // compress if we gain at least 5% of space by compressing a block (same as default)
+	})
 
 	x := make([]map[string]any, 0)
 	err = json.Unmarshal(data, &x)

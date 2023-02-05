@@ -82,7 +82,10 @@ func main() {
 	data, err := io.ReadAll(f)
 	fatalIfErr(err)
 
-	cache := zipcache.New()
+	cache := zipcache.New(zipcache.Config{
+		ChunkSize:    4096 * 4, // defines how many entries will be compressed together. It depends on the average entry size.
+		ChunkMinGain: 0.05, // compress if we gain at least 5% of space by compressing a block (same as default)
+	})
 
 	x := make([]map[string]any, 0)
 	err = json.Unmarshal(data, &x)
@@ -111,7 +114,7 @@ time (seconds):	 0.006377
 ratio (%):	 0.11
 ```
 
-Not only we save about 23% additional space, but code is also faster, since compression is invoked less times.
+Not only we save about 23% additional space, but code is ~200x faster, since compression is invoked less times.
 
 # Limitations
 
