@@ -8,10 +8,8 @@ import (
 	"sync/atomic"
 )
 
-// put a value across multiple blocks
-
 const (
-	chunkSizeDefault        = 1024
+	chunkSizeDefault        = 4096
 	compressionLevelDefault = 1
 )
 
@@ -24,7 +22,7 @@ var (
 	ErrKeyExist = errors.New("key already exists")
 )
 
-type CompressedCache struct {
+type ZipCache struct {
 	isCompressing atomic.Bool
 
 	mtx sync.RWMutex
@@ -32,6 +30,7 @@ type CompressedCache struct {
 
 	blocks []*atomic.Pointer[chunk]
 
+	nChunks         atomic.Int32
 	currChunkOffset uint32
 }
 
@@ -56,18 +55,19 @@ func newBlock() *chunk {
 	}
 }
 
-func New() *CompressedCache {
-	c := &CompressedCache{
+func New() *ZipCache {
+	c := &ZipCache{
 		isCompressing: atomic.Bool{},
 		m:             map[string]pointer{},
 		blocks:        make([]*atomic.Pointer[chunk], 0),
 	}
 	c.blocks = append(c.blocks, &atomic.Pointer[chunk]{})
 	c.blocks[0].Store(newBlock())
+	c.nChunks.Store(1)
 	return c
 }
 
-func (c *CompressedCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
+func (c *ZipCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 	for _, ptr := range ptrs {
 		var buf bytes.Buffer
 
@@ -103,7 +103,7 @@ func (c *CompressedCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
 	return nil
 }
 
-func (c *CompressedCache) uncompress(src, dst []byte) (int, error) {
+func (c *ZipCache) uncompress(src, dst []byte) (int, error) {
 	r, _ := gzip.NewReader(bytes.NewReader(src))
 	return r.Read(dst)
 }
@@ -112,7 +112,7 @@ func newPointer(blockOffset, byteOffset, len uint64) pointer {
 	return pointer((blockOffset << 32) + (byteOffset << 16) + len)
 }
 
-func (c *CompressedCache) Put(k, v []byte) error {
+func (c *ZipCache) Put(k, v []byte) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
@@ -141,6 +141,8 @@ func (c *CompressedCache) Put(k, v []byte) error {
 
 			c.blocks = append(c.blocks, &ptr)
 			c.currChunkOffset = 0
+
+			c.nChunks.Add(1)
 		}
 		size -= int(n)
 	}
@@ -151,7 +153,7 @@ func (c *CompressedCache) Put(k, v []byte) error {
 	return nil
 }
 
-func (c *CompressedCache) Get(k []byte) ([]byte, error) {
+func (c *ZipCache) Get(k []byte) ([]byte, error) {
 	c.mtx.RLock()
 
 	ptr, ok := c.m[string(k)]
@@ -185,7 +187,6 @@ func (c *CompressedCache) Get(k []byte) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			return uncompressed[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
 		}
 
 		endOff := off + ptr.Len() - n
@@ -203,4 +204,17 @@ func (c *CompressedCache) Get(k []byte) ([]byte, error) {
 	}
 
 	return dst, nil
+}
+
+func (c *ZipCache) Size() int64 {
+	c.mtx.RLock()
+
+	var size int64
+	for _, b := range c.blocks {
+		size += int64(len(b.Load().data))
+	}
+
+	c.mtx.RUnlock()
+
+	return size
 }
