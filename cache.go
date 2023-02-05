@@ -2,24 +2,27 @@ package zipcache
 
 import (
 	"bytes"
-	"compress/flate"
+	"compress/gzip"
 	"errors"
 	"sync"
 	"sync/atomic"
 )
 
+// put a value across multiple blocks
+
 const (
-	blockSizeDefault        = 4096
+	chunkSizeDefault        = 1024
 	compressionLevelDefault = 1
 )
 
-type Block struct {
-	size         int
+type chunk struct {
 	isCompressed bool
 	data         []byte
 }
 
-var ErrCompressionRunning = errors.New("already running compression")
+var (
+	ErrKeyExist = errors.New("key already exists")
+)
 
 type CompressedCache struct {
 	isCompressing atomic.Bool
@@ -27,9 +30,9 @@ type CompressedCache struct {
 	mtx sync.RWMutex
 	m   map[string]pointer
 
-	blocks []atomic.Pointer[Block]
+	blocks []*atomic.Pointer[chunk]
 
-	currBlockOffset uint32
+	currChunkOffset uint32
 }
 
 type pointer uint64
@@ -46,11 +49,10 @@ func (p pointer) Len() int {
 	return int(uint16(p))
 }
 
-func newBlock() *Block {
-	return &Block{
-		size:         0,
+func newBlock() *chunk {
+	return &chunk{
 		isCompressed: false,
-		data:         make([]byte, blockSizeDefault),
+		data:         make([]byte, chunkSizeDefault),
 	}
 }
 
@@ -58,45 +60,51 @@ func New() *CompressedCache {
 	c := &CompressedCache{
 		isCompressing: atomic.Bool{},
 		m:             map[string]pointer{},
-		blocks:        make([]atomic.Pointer[Block], 1),
+		blocks:        make([]*atomic.Pointer[chunk], 0),
 	}
+	c.blocks = append(c.blocks, &atomic.Pointer[chunk]{})
 	c.blocks[0].Store(newBlock())
 	return c
 }
 
-func (c *CompressedCache) compressBlock(ptr atomic.Pointer[Block]) error {
-	var buf bytes.Buffer
+func (c *CompressedCache) compressBlock(ptrs []*atomic.Pointer[chunk]) error {
+	for _, ptr := range ptrs {
+		var buf bytes.Buffer
 
-	w, err := flate.NewWriter(&buf, compressionLevelDefault)
-	if err != nil {
-		return err
+		w := gzip.NewWriter(&buf)
+
+		b := ptr.Load()
+
+		if _, err := w.Write(b.data); err != nil {
+			return err
+		}
+
+		if err := w.Flush(); err != nil {
+			return err
+		}
+
+		if err := w.Close(); err != nil {
+			return err
+		}
+
+		newBlock := &chunk{
+			isCompressed: buf.Len() < len(b.data),
+			data:         b.data,
+		}
+
+		if buf.Len() < len(b.data) { // TODO: check if compressed data saves at least some percentage of space
+			newBlock.data = buf.Bytes()
+		}
+
+		ptr.Store(newBlock)
 	}
 
-	b := ptr.Load()
-	if _, err := w.Write(b.data[:c.currBlockOffset]); err != nil {
-		return err
-	}
-
-	if err := w.Flush(); err != nil {
-		return err
-	}
-
-	newBlock := &Block{
-		isCompressed: buf.Len() < len(b.data),
-		data:         b.data,
-	}
-
-	if buf.Len() < len(b.data) { // TODO: check if compressed data saves at least some percentage of space
-		newBlock.data = buf.Bytes()
-	}
-
-	ptr.Store(newBlock)
 	c.isCompressing.Store(false)
-	return err
+	return nil
 }
 
 func (c *CompressedCache) uncompress(src, dst []byte) (int, error) {
-	r := flate.NewReader(bytes.NewReader(src))
+	r, _ := gzip.NewReader(bytes.NewReader(src))
 	return r.Read(dst)
 }
 
@@ -108,40 +116,38 @@ func (c *CompressedCache) Put(k, v []byte) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	currBlockPtr := c.blocks[len(c.blocks)-1]
-	if c.currBlockOffset+uint32(len(v)) > blockSizeDefault {
-		if !c.isCompressing.CompareAndSwap(false, true) {
-			return ErrCompressionRunning
-		}
-
-		prevBlockPtr := currBlockPtr
-		currBlock := &Block{
-			size:         0,
-			isCompressed: false,
-			data:         make([]byte, blockSizeDefault),
-		}
-		var ptr atomic.Pointer[Block]
-		ptr.Store(currBlock)
-
-		c.blocks = append(c.blocks, ptr)
-		c.currBlockOffset = 0
-
-		go c.compressBlock(prevBlockPtr)
+	if _, has := c.m[string(k)]; has {
+		return ErrKeyExist
 	}
 
-	newOffset := c.currBlockOffset + uint32(len(v))
+	c.m[string(k)] = newPointer(uint64(uint32(len(c.blocks)-1)), uint64(c.currChunkOffset), uint64(len(v)))
 
-	currBlock := currBlockPtr.Load()
-	copy(currBlock.data[c.currBlockOffset:], v)
+	compressChunks := make([]*atomic.Pointer[chunk], 0)
 
-	blockOffset := uint64(uint32(len(c.blocks) - 1))
-	byteOffset := uint64(c.currBlockOffset)
-	len := uint64(len(v))
+	size := len(v)
+	for size > 0 {
+		currChunkPtr := c.blocks[len(c.blocks)-1]
+		currChunk := currChunkPtr.Load()
 
-	c.m[string(k)] = newPointer(blockOffset, byteOffset, len)
+		n := copy(currChunk.data[c.currChunkOffset:], v[len(v)-size:])
+		c.currChunkOffset += uint32(n)
 
-	c.currBlockOffset = newOffset
+		if c.currChunkOffset == chunkSizeDefault {
+			compressChunks = append(compressChunks, currChunkPtr)
 
+			var ptr atomic.Pointer[chunk]
+			bb := newBlock()
+			ptr.Store(bb)
+
+			c.blocks = append(c.blocks, &ptr)
+			c.currChunkOffset = 0
+		}
+		size -= int(n)
+	}
+
+	if len(compressChunks) > 0 {
+		go c.compressBlock(compressChunks)
+	}
 	return nil
 }
 
@@ -154,17 +160,47 @@ func (c *CompressedCache) Get(k []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	bb := c.blocks[ptr.Block()].Load()
+	currChunk := c.blocks[ptr.Block()].Load()
+	if !currChunk.isCompressed && (ptr.Offset()+ptr.Len() <= len(currChunk.data)) {
+		c.mtx.RUnlock()
+		return currChunk.data[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
+	}
+
+	nChunks := 1 + (ptr.Len()+(chunkSizeDefault-1))/chunkSizeDefault
+	chunks := make([]*chunk, 0, nChunks)
+	for i := 0; i < nChunks; i++ {
+		chunks = append(chunks, c.blocks[i+ptr.Block()].Load())
+	}
 	c.mtx.RUnlock()
 
-	data := bb.data
-	if bb.isCompressed {
-		dst := make([]byte, blockSizeDefault) // keep this separatedly?
-		_, err := c.uncompress(bb.data, dst)
-		if err != nil {
-			return nil, err
+	dst := make([]byte, ptr.Len())
+	off := ptr.Offset()
+	n := 0
+	for _, chunk := range chunks {
+		uncompressed := chunk.data
+
+		if chunk.isCompressed {
+			uncompressed = make([]byte, chunkSizeDefault)
+			_, err := c.uncompress(chunk.data, uncompressed)
+			if err != nil {
+				return nil, err
+			}
+			return uncompressed[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
 		}
-		data = dst
+
+		endOff := off + ptr.Len() - n
+		if endOff > len(uncompressed) {
+			endOff = len(uncompressed)
+		}
+
+		copied := copy(dst[n:], uncompressed[off:endOff])
+		n += copied
+		off = 0
+
+		if n == ptr.Len() {
+			break
+		}
 	}
-	return data[ptr.Offset() : ptr.Offset()+ptr.Len()], nil
+
+	return dst, nil
 }
