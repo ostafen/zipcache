@@ -9,8 +9,7 @@ import (
 )
 
 const (
-	chunkSizeDefault        = 4096
-	compressionLevelDefault = 1
+	chunkSizeDefault = 4096 * 4
 )
 
 type chunk struct {
