@@ -82,8 +82,9 @@ func main() {
 	data, err := io.ReadAll(f)
 	fatalIfErr(err)
 
-	cfg := zipcache.DefaultConfig().WithChunkSize(4096*4). // defines how many entries will be compressed together. Set this according to average entry size.
-								WithReaderWriter(gzipReader, gzipWriter) // use gzip compression algorithm. Default is deflate.
+	cfg := zipcache.DefaultConfig().
+			WithChunkSize(4096*4). // defines how many entries will be compressed together. Set this according to average entry size.
+			WithReaderWriter(gzipReader, gzipWriter) // use gzip compression algorithm. Default is deflate.
 
 	cache := zipcache.New(cfg)
 
@@ -120,3 +121,10 @@ Not only we save about 23% additional space, but code is ~200x faster, since com
 
 ZipCache is a grow-only cache. Cache items are not evicted and mappings cannot be updated nor deleted. However, support for update/deletion is planned.
 
+# When to use ZipCache
+
+Use ZipCache when:
+
+- you are more concerned about RAM consumption rather then absolute lookup performance;
+- you never change your key-value mappings once you enter your items in the cache;
+- you don't need to expire your items.
