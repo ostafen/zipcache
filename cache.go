@@ -86,18 +86,22 @@ type ZipCache struct {
 	currChunkOffset uint32
 }
 
-type pointer uint64
+type pointer struct {
+	blockNumber uint32
+	offset      uint32
+	size        uint32
+}
 
 func (p pointer) Block() int {
-	return int(p >> 32)
+	return int(p.blockNumber)
 }
 
 func (p pointer) Offset() int {
-	return int(uint32(p) >> 16)
+	return int(p.offset)
 }
 
 func (p pointer) Len() int {
-	return int(uint16(p))
+	return int(p.size)
 }
 
 func (c *ZipCache) newChunk() *chunk {
@@ -168,8 +172,12 @@ func (c *ZipCache) uncompress(src, dst []byte) (int, error) {
 	return r.Read(dst)
 }
 
-func newPointer(blockOffset, byteOffset, len uint64) pointer {
-	return pointer((blockOffset << 32) + (byteOffset << 16) + len)
+func newPointer(blockNumber, byteOffset, len uint64) pointer {
+	return pointer{
+		size:        uint32(len),
+		offset:      uint32(byteOffset),
+		blockNumber: uint32(blockNumber),
+	}
 }
 
 func (c *ZipCache) Put(k, v []byte) error {
